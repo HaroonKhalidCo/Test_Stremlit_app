@@ -1,119 +1,178 @@
-import streamlit as st
-import faiss
-from llama_index.core import VectorStoreIndex, Document, Settings
-from llama_index.vector_stores.faiss import FaissVectorStore
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.groq import Groq
-from docx import Document as DocxDocument
-import pymupdf4llm
-import tempfile
 import os
+import streamlit as st
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.prompts import PromptTemplate
+import tempfile
+from litellm import completion
+import pymupdf4llm
+import asyncio
+from groq import Groq
 
-# Initialize session state
-if "api_key" not in st.session_state:
-    st.session_state.api_key = ""
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "index" not in st.session_state:
-    st.session_state.index = None
+# Page configuration
+st.set_page_config(page_title="Document Chat Comparison", page_icon="🤖", layout="wide")
 
-def read_file(file):
-    if file.name.endswith('.pdf'):
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(file.getvalue())
-            tmp_file_path = tmp_file.name
+# Initialize session state for chat history
+if "messages_groq" not in st.session_state:
+    st.session_state.messages_groq = []
+if "messages_gemini" not in st.session_state:
+    st.session_state.messages_gemini = []
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "groq_client" not in st.session_state:
+    st.session_state.groq_client = None
 
-        try:
-            # Use pymupdf4llm with the temporary file path
-            md_text = pymupdf4llm.to_markdown(tmp_file_path)
-        finally:
-            # Clean up the temporary file
-            os.unlink(tmp_file_path)
-
-        return md_text
-    elif file.name.endswith('.docx'):
-        return "\n".join(para.text for para in DocxDocument(file).paragraphs)
-    else:
-        return file.getvalue().decode()
-
-def process_documents(uploaded_files):
-    documents = [Document(text=read_file(file), metadata={"filename": file.name}) for file in uploaded_files]
-    
-    d = 384  # Dimension of the embedding model
-    faiss_index = faiss.IndexFlatL2(d)
-    vector_store = FaissVectorStore(faiss_index=faiss_index)
-    
-    st.session_state.index = VectorStoreIndex.from_documents(documents, vector_store=vector_store)
-
-def get_bot_response(user_input):
-    if st.session_state.index is None:
-        return "Please upload some documents first!"
-    
-    query_engine = st.session_state.index.as_query_engine(
-        response_mode="compact"
-    )
-    response = query_engine.query(user_input)
-    return str(response)
-
+# Function to clear chat history
 def clear_chat_history():
-    st.session_state.chat_history = []
+    st.session_state.messages_groq = []
+    st.session_state.messages_gemini = []
+    st.rerun()
 
-# Streamlit UI setup
-st.set_page_config(page_title="Document QA Bot", page_icon="📚", layout="wide")
-
-# Sidebar for API key input and document upload
+# Sidebar for configuration
 with st.sidebar:
-    st.header("🔑 API Key")
-    st.session_state.api_key = st.text_input("Enter your Groq API Key", type="password")
+    st.header("📁 Configuration")
+    
+    # API Keys
+    groq_api_key = st.text_input("🔑 Groq API Key:", type="password")
+    gemini_api_key = st.text_input("🔑 Gemini API Key:", type="password")
+    
+    # Initialize Groq client if API key is provided
+    if groq_api_key:
+        st.session_state.groq_client = Groq(api_key=groq_api_key)
+    
+    # Document upload
+    uploaded_file = st.file_uploader("📤 Upload Document (PDF)", type=["pdf"])
+    
+    if uploaded_file and groq_api_key and gemini_api_key:
+        with st.spinner("Processing document..."):
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(uploaded_file.getvalue())
+                temp_file_path = temp_file.name
 
-    st.header("📁 Document Upload")
-    uploaded_files = st.file_uploader(
-        "Upload your documents (PDF, DOCX, TXT)",
-        accept_multiple_files=True,
-        type=['pdf', 'docx', 'txt']
-    )
-    
-    if uploaded_files and st.session_state.api_key:
-        with st.spinner("Processing documents..."):
-            # Initialize Groq LLM and embedding model only if API key is provided
-            llm = Groq(api_key=st.session_state.api_key, model="llama-3.3-70b-versatile")
-            embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            try:
+                # Convert PDF to markdown using pymupdf4llm
+                markdown_text = pymupdf4llm.to_markdown(temp_file_path)
+                
+                # Split text
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200,
+                    separators=["\n\n", "\n", " ", ""]
+                )
+                
+                # Create text chunks
+                texts = text_splitter.create_documents([markdown_text])
+                
+                # Create vector store with Google embeddings
+                embeddings = GoogleGenerativeAIEmbeddings(
+                    model="models/embedding-001",
+                    google_api_key=gemini_api_key
+                )
+                st.session_state.vector_store = FAISS.from_documents(
+                    documents=texts,
+                    embedding=embeddings
+                )
+                
+                st.success("Document processed successfully!")
             
-            # Configure global settings
-            Settings.embed_model = embed_model
-            Settings.llm = llm
-            
-            process_documents(uploaded_files)
-        st.success(f"{len(uploaded_files)} document(s) processed successfully!")
+            finally:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
     
+    # Clear chat button
     st.header("🧹 Clear Chat")
     if st.button("Clear Chat History"):
         clear_chat_history()
-        st.rerun()
 
-# Main content area
-st.title("📚 Document QA Bot")
-st.write("Ask questions about your uploaded documents!")
+# Main chat interface
+st.title("📚 Document Chat Comparison 🤖")
 
-# Chat interface
-for message in st.session_state.chat_history:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# Model selection dropdowns in two columns
+col1, col2 = st.columns(2)
+with col1:
+    groq_model = st.selectbox(
+        "Select Groq Model:",
+        ["mixtral-8x7b-32768", "llama-3.3-70b-versatile", "llama3-8b-8192"]
+    )
+with col2:
+    gemini_model = st.selectbox(
+        "Select Gemini Model:",
+        ["gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
+    )
 
-user_input = st.chat_input("Ask a question about your documents...")
+# Chat interface split into two columns
+chat_col1, chat_col2 = st.columns(2)
 
-if user_input:
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-    
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = get_bot_response(user_input)
-        message_placeholder.markdown(full_response)
-    
-    st.session_state.chat_history.append({"role": "assistant", "content": full_response})
+# Display chat histories
+with chat_col1:
+    st.subheader("Groq Response")
+    for message in st.session_state.messages_groq:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-if not st.session_state.chat_history:
-    st.info("Upload documents in the sidebar, then ask questions to get started!")
+with chat_col2:
+    st.subheader("Gemini Response")
+    for message in st.session_state.messages_gemini:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+# Chat input
+if prompt := st.chat_input("Ask a question about your document"):
+    if not st.session_state.vector_store:
+        st.error("Please upload a document first!")
+    elif not groq_api_key or not gemini_api_key:
+        st.error("Please provide both API keys!")
+    else:
+        # Add user message to both chat histories
+        st.session_state.messages_groq.append({"role": "user", "content": prompt})
+        st.session_state.messages_gemini.append({"role": "user", "content": prompt})
+        
+        # Retrieve relevant context using the new invoke method
+        retriever = st.session_state.vector_store.as_retriever()
+        context = asyncio.run(retriever.ainvoke(prompt))  # Using ainvoke for async retrieval
+        context_text = "\n".join([doc.page_content for doc in context])
+        
+        # Prepare prompt template
+        template = """
+        Use the following context to answer the question. If the answer cannot be found in the context, say so.
+        The context is in markdown format, so please format your response accordingly.
+        
+        Context: {context}
+        
+        Question: {question}
+        
+        Answer:
+        """
+        
+        prompt_template = PromptTemplate(
+            input_variables=["context", "question"],
+            template=template
+        )
+        
+        formatted_prompt = prompt_template.format(context=context_text, question=prompt)
+        
+        try:
+            # Get Groq response using the Groq client
+            groq_chat_completion = st.session_state.groq_client.chat.completions.create(
+                model=groq_model,
+                messages=[{"role": "user", "content": formatted_prompt}]
+            )
+            groq_content = groq_chat_completion.choices[0].message.content
+            st.session_state.messages_groq.append({"role": "assistant", "content": groq_content})
+            
+            # Get Gemini response
+            gemini_response = completion(
+                model=f"gemini/{gemini_model}",
+                messages=[{"role": "user", "content": formatted_prompt}],
+                api_key=gemini_api_key
+            )
+            gemini_content = gemini_response.choices[0].message.content
+            st.session_state.messages_gemini.append({"role": "assistant", "content": gemini_content})
+            
+            # Force refresh to show new messages
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"Error generating response: {str(e)}")
